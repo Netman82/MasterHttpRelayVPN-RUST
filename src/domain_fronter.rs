@@ -423,7 +423,12 @@ pub struct DomainFronter {
     /// Per-batch HTTP timeout. Mirrors `Config::request_timeout_secs`
     /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
     /// so a single config field tunes the timeout used everywhere.
+    /// Applies to connection establishment and response header arrival only.
     batch_timeout: Duration,
+    /// Per-chunk body streaming idle timeout. Mirrors `Config::stream_timeout_secs`.
+    /// Applied per-iteration of the body drain loop so large responses
+    /// through Apps Script are not killed mid-transfer by `batch_timeout`.
+    stream_timeout: Duration,
     /// Optional second-hop exit node (Deno Deploy / fly.io / etc.)
     /// to bypass CF-anti-bot blocks on sites that flag Google datacenter
     /// IPs (chatgpt.com, claude.ai, grok.com, x.com). Mirrors
@@ -642,6 +647,9 @@ impl DomainFronter {
             batch_timeout: Duration::from_secs(
                 config.request_timeout_secs.clamp(5, 300),
             ),
+            stream_timeout: Duration::from_secs(
+                config.stream_timeout_secs.clamp(10, 3600),
+            ),
             exit_node_enabled: config.exit_node.enabled
                 && !config.exit_node.relay_url.is_empty()
                 && !config.exit_node.psk.is_empty(),
@@ -695,6 +703,11 @@ impl DomainFronter {
     /// change. Clamped to `[5s, 300s]` at construction.
     pub(crate) fn batch_timeout(&self) -> Duration {
         self.batch_timeout
+    }
+
+    /// Per-chunk body streaming idle timeout. Clamped to `[10s, 3600s]`.
+    pub(crate) fn stream_timeout(&self) -> Duration {
+        self.stream_timeout
     }
 
     /// Record one relay call toward the daily budget. Called once per
@@ -1533,18 +1546,17 @@ impl DomainFronter {
             })?;
         }
 
-        // Phase 2: response headers + body drain. Bounded by the
-        // caller's deadline. Errors and timeout here are
-        // `RequestSent::Maybe` — the request is on the wire and may
-        // already have side effects.
-        let response_phase = async {
+        // Phase 2a: wait for response headers. Bounded by the caller's
+        // deadline (`batch_timeout` / `request_timeout_secs`). A timeout
+        // here means the relay never responded — safe to retry.
+        let header_phase = async {
             let response = response_fut.await.map_err(|e| {
                 (
                     FronterError::Relay(format!("h2 response: {}", e)),
                     RequestSent::Maybe,
                 )
             })?;
-            let (parts, mut body) = response.into_parts();
+            let (parts, body) = response.into_parts();
             let status = parts.status.as_u16();
 
             // Convert headers to the (String, String) Vec the rest of
@@ -1557,27 +1569,12 @@ impl DomainFronter {
                     headers.push((name.as_str().to_string(), v.to_string()));
                 }
             }
-
-            // Drain body. Release flow-control credit per chunk so
-            // large responses don't stall after the initial 4 MB window.
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.map_err(|e| {
-                    (
-                        FronterError::Relay(format!("h2 body chunk: {}", e)),
-                        RequestSent::Maybe,
-                    )
-                })?;
-                let n = chunk.len();
-                buf.extend_from_slice(&chunk);
-                let _ = body.flow_control().release_capacity(n);
-            }
-            Ok::<_, (FronterError, RequestSent)>((status, headers, buf))
+            Ok::<_, (FronterError, RequestSent)>((status, headers, body))
         };
 
-        let (status, headers, mut buf) = match tokio::time::timeout(
+        let (status, headers, mut body) = match tokio::time::timeout(
             response_deadline,
-            response_phase,
+            header_phase,
         )
         .await
         {
@@ -1585,6 +1582,32 @@ impl DomainFronter {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
         };
+
+        // Phase 2b: drain body. Each chunk is individually bounded by
+        // `stream_timeout` (default 300s) so large responses routed
+        // through Apps Script (where a 256 KB range chunk can take 30-90s
+        // of wall-clock time) are not killed by the tighter `batch_timeout`.
+        // Release flow-control credit per chunk so large responses don't
+        // stall after the initial 4 MB window.
+        let stream_timeout = self.stream_timeout();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match tokio::time::timeout(stream_timeout, body.data()).await {
+                Ok(None) => break,
+                Ok(Some(Ok(chunk))) => {
+                    let n = chunk.len();
+                    buf.extend_from_slice(&chunk);
+                    let _ = body.flow_control().release_capacity(n);
+                }
+                Ok(Some(Err(e))) => {
+                    return Err((
+                        FronterError::Relay(format!("h2 body chunk: {}", e)),
+                        RequestSent::Maybe,
+                    ));
+                }
+                Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
+            }
+        }
 
         // Mirror `read_http_response`: if the server gzipped the body
         // (we asked for it via accept-encoding), decompress before
@@ -1785,20 +1808,34 @@ impl DomainFronter {
                     return bytes;
                 }
                 Err(e) if !e.is_retryable() => {
-                    // The exit node may have already processed this
-                    // request (h2 post-send failure on a POST etc.).
-                    // Don't fall through to the direct path — that
-                    // would re-send to the same destination via Apps
-                    // Script and duplicate the side effect.
-                    tracing::warn!(
-                        "exit node failed for {} and request was already sent ({}); not falling back to direct Apps Script",
-                        url,
-                        e,
-                    );
-                    self.relay_failures.fetch_add(1, Ordering::Relaxed);
-                    let inner = e.into_inner();
-                    self.record_site(url, false, 0, t0.elapsed().as_nanos() as u64);
-                    return error_response(502, &format!("Relay error: {}", inner));
+                    // The NonRetryable guard exists to prevent duplicate
+                    // side-effects on POST/PUT/PATCH/DELETE: if the h2
+                    // outer call reached Apps Script and timed out, the
+                    // inner request may have already been executed by the
+                    // exit node. Falling through would re-send it.
+                    //
+                    // For idempotent methods (GET/HEAD/OPTIONS) there are
+                    // no side-effects, so re-sending via direct Apps Script
+                    // is always safe. Range downloads are GET — if a script
+                    // ID hits its 6-minute cap and times out, falling back
+                    // to direct Apps Script (round-robining to a fresh ID)
+                    // is the correct behaviour rather than returning 502.
+                    if is_method_safe_for_fanout(method) {
+                        tracing::warn!(
+                            "exit node non-retryable timeout for {} {} — method is idempotent, falling back to direct Apps Script",
+                            method, url,
+                        );
+                        // fall through to the regular relay path below
+                    } else {
+                        tracing::warn!(
+                            "exit node failed for {} {} and request was already sent ({}); not falling back to direct Apps Script",
+                            method, url, e,
+                        );
+                        self.relay_failures.fetch_add(1, Ordering::Relaxed);
+                        let inner = e.into_inner();
+                        self.record_site(url, false, 0, t0.elapsed().as_nanos() as u64);
+                        return error_response(502, &format!("Relay error: {}", inner));
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1983,10 +2020,53 @@ impl DomainFronter {
             let raw = self.relay(method, url, headers, body).await;
             return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
-        // If the client already sent a Range header, honour it as-is —
-        // don't second-guess a caller that knows what bytes they want.
-        if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")) {
+        // If the client already sent a Range header, inspect it:
+        //
+        // • bytes=N- or bytes=N-M with N>0 (resume / mid-file seek): route
+        //   through the parallel chunk path starting at offset N. Passing the
+        //   raw header to relay() would ask Apps Script to return everything
+        //   from byte N to EOF in one call — for a 3 GiB file that's well
+        //   over Apps Script's 50 MiB response cap, guaranteed 504 every try.
+        //
+        // • bytes=0-M (small specific range from the start): pass through
+        //   to relay() as-is. On relay failure close cleanly so the client
+        //   retries with its Range intact rather than restarting from byte 0.
+        if let Some(range_val) = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+            .map(|(_, v)| v.clone())
+        {
+            if let Some(start) = parse_range_start(&range_val).filter(|&s| s > 0) {
+                tracing::debug!(
+                    "range-parallel-resume: client Range {} for {}; probing from offset {}",
+                    range_val, url, start,
+                );
+                return self
+                    .stream_range_from_offset(
+                        writer,
+                        method,
+                        url,
+                        headers,
+                        body,
+                        start,
+                        chunk,
+                        transform_head,
+                    )
+                    .await;
+            }
+            // start == 0 or unparseable — honour as-is with clean-close on failure.
             let raw = self.relay(method, url, headers, body).await;
+            let status = split_response(&raw).map(|(s, _, _)| s).unwrap_or(0);
+            if status >= 400 || status == 0 {
+                tracing::warn!(
+                    "range relay returned status {} for request {}; closing cleanly so client retries with Range",
+                    status, url,
+                );
+                return Err(std::io::Error::other(format!(
+                    "range relay status {} — closing for clean resume",
+                    status
+                )));
+            }
             return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
 
@@ -2191,6 +2271,119 @@ impl DomainFronter {
         // what we got; we ship plain bytes).
         let raw = assemble_full_200(&resp_headers, &full);
         write_response_with_head_transform(writer, &raw, &transform_head).await
+    }
+
+    /// Resume a large download from a byte offset by probing at
+    /// `[start, start+chunk-1]` and streaming the remaining chunks in
+    /// parallel — exactly like the initial download path but starting
+    /// mid-file. Called when the client sends `Range: bytes=N-` with
+    /// N > 0 (wget `-c`, browser resume). Responds with `206 Partial
+    /// Content` so the client appends to its existing partial file.
+    async fn stream_range_from_offset<W, F>(
+        &self,
+        writer: &mut W,
+        method: &str,
+        url: &str,
+        client_headers: &[(String, String)],
+        body: &[u8],
+        start: u64,
+        chunk: u64,
+        transform_head: &F,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        F: Fn(&[u8]) -> Vec<u8>,
+    {
+        const MAX_PARALLEL: usize = 16;
+
+        // Strip client's Range header; add our probe range [start, start+chunk-1].
+        let mut probe_headers: Vec<(String, String)> = client_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+            .cloned()
+            .collect();
+        probe_headers.push((
+            "Range".into(),
+            format!("bytes={}-{}", start, start + chunk - 1),
+        ));
+
+        let first = self.relay(method, url, &probe_headers, body).await;
+        let (status, resp_headers, resp_body) = match split_response(&first) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "range-parallel-resume: malformed probe response for {}; closing cleanly",
+                    url
+                );
+                return Err(std::io::Error::other(
+                    "range-parallel-resume: malformed probe — closing for clean resume",
+                ));
+            }
+        };
+
+        if status != 206 {
+            if status >= 400 {
+                tracing::warn!(
+                    "range-parallel-resume: probe returned {} for {}; closing cleanly",
+                    status, url,
+                );
+                return Err(std::io::Error::other(format!(
+                    "range-parallel-resume: probe status {} — closing for clean resume",
+                    status,
+                )));
+            }
+            // Non-206 success (origin sent 200 for the full body) — forward as-is.
+            return write_response_with_head_transform(writer, &first, transform_head).await;
+        }
+
+        let probe_range =
+            match validate_probe_range_at_offset(status, &resp_headers, resp_body, start, start + chunk - 1)
+            {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        "range-parallel-resume: invalid 206 for {}; closing cleanly",
+                        url,
+                    );
+                    return Err(std::io::Error::other(
+                        "range-parallel-resume: invalid 206 — closing for clean resume",
+                    ));
+                }
+            };
+        let total = probe_range.total;
+
+        // Probe covered the rest of the file — forward this 206 as-is.
+        if (probe_range.end + 1) >= total {
+            return write_response_with_head_transform(writer, &first, transform_head).await;
+        }
+
+        let probe_end = probe_range.end;
+        let body_total = total - start;
+        let expected_chunks = (total - probe_end - 1).div_ceil(chunk);
+        tracing::info!(
+            "range-parallel-resume: {} total, resuming from byte {}, {} more chunks after probe, up to {} in flight for {}",
+            total, start, expected_chunks, MAX_PARALLEL, url,
+        );
+
+        // base_headers for fetch_chunks_stream must not include Range
+        // (fetch_chunks_stream adds its own per-chunk Range header).
+        let base_headers: Vec<(String, String)> = client_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+            .cloned()
+            .collect();
+
+        let fetches = self.fetch_chunks_stream(
+            url,
+            &base_headers,
+            plan_remaining_ranges(probe_end, total, chunk),
+            total,
+            MAX_PARALLEL,
+        );
+
+        let head = assemble_206_head(&resp_headers, start, total);
+        let head = transform_head(&head);
+        stream_chunks_to_writer(writer, &head, resp_body, body_total, fetches, url).await
     }
 
     /// Backward-compatible wrapper around `relay_parallel_range_to`
@@ -3408,6 +3601,34 @@ fn validate_probe_range(
     None
 }
 
+/// Parse the start byte from a `Range: bytes=N-` or `Range: bytes=N-M` header value.
+fn parse_range_start(range_header: &str) -> Option<u64> {
+    let s = range_header.trim().strip_prefix("bytes=")?;
+    s.split('-').next()?.trim().parse::<u64>().ok()
+}
+
+/// Variant of `validate_probe_range` for mid-file resume probes where
+/// `Content-Range: bytes N-M/total` has a non-zero start.
+fn validate_probe_range_at_offset(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    req_start: u64,
+    req_end: u64,
+) -> Option<ContentRange> {
+    if status != 206 {
+        return None;
+    }
+    let range = parse_content_range(headers)?;
+    if range.start != req_start || range.end > req_end {
+        return None;
+    }
+    if content_range_matches_body(range, body.len()) {
+        return Some(range);
+    }
+    None
+}
+
 fn probe_range_covers_complete_entity(range: ContentRange, requested_end: u64) -> bool {
     // Apps Script may decode a gzip body while preserving the origin's
     // compressed Content-Range. For the synthetic first probe only, a
@@ -3494,6 +3715,46 @@ fn assemble_200_head(src_headers: &[(String, String)], declared_length: u64) -> 
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", declared_length).as_bytes());
+    out
+}
+
+/// Build a `HTTP/1.1 206 Partial Content` head for the resume streaming
+/// path. `start` is the first byte the client requested; `total` is the
+/// full file size reported by the origin's `Content-Range`. Mirrors
+/// `assemble_200_head`'s header-skip rules.
+fn assemble_206_head(src_headers: &[(String, String)], start: u64, total: u64) -> Vec<u8> {
+    let skip = |k: &str| {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "content-length"
+                | "content-range"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive",
+        )
+    };
+    let length = total.saturating_sub(start);
+    let mut out: Vec<u8> = b"HTTP/1.1 206 Partial Content\r\n".to_vec();
+    for (k, v) in src_headers {
+        if skip(k) {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(
+        format!(
+            "Content-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+            start,
+            total - 1,
+            total,
+            length,
+        )
+        .as_bytes(),
+    );
     out
 }
 

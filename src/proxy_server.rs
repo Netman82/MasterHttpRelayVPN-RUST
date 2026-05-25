@@ -2185,6 +2185,12 @@ async fn run_mitm_then_relay(
             }
         }
     }
+    // Always send TLS close_notify so the client gets a clean EOF.
+    // Without this, dropping `tls` mid-stream (e.g. after a partial
+    // range-parallel response) causes wget/curl to report
+    // "TLS connection was non-properly terminated" rather than a
+    // clean truncation they can resume from.
+    let _ = tls.shutdown().await;
 }
 
 /// True if `s` parses as an IPv4 or IPv6 literal. Used to decide whether
